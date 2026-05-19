@@ -1,160 +1,139 @@
 """
-PySpark Join típusok gyakorlása
+PySpark fizikai join stratégiák gyakorlása
 
-Adatok:
-  products.csv  — 14 termék (product_id 1-14)
-  orders.csv    — 10 rendelés
-                   - order 8,9: product_id 99/100 NEM létezik → outer join különbség látszik
-                   - product 2,4,6,8,10,14: nincs hozzájuk rendelés
-  customers.csv — 6 vevő
-                   - customer 5,6: nincs rendelésük → anti/semi join látszik
-                   - order 9: customer_id 7 NEM létezik
+Spark 4 fő stratégiát választhat (vagy kényszeríthetsz hint-tel):
 
-Szintaxis: df1.join(df2, on=<feltétel>, how=<típus>)
+  1. BroadcastHashJoin    — kis tábla szétküldve minden executorra, hash lookup
+  2. ShuffledHashJoin     — mindkét tábla shuffle-öl join key szerint, hash tábla épül
+  3. SortMergeJoin        — mindkét tábla shuffle + sort, majd merge (default nagy táblákhoz)
+  4. BroadcastNestedLoopJoin — non-equi join esetén, minden sor × minden sor (lassú!)
+
+Hint szintaxis: df.hint("BROADCAST") / df.hint("SHUFFLE_HASH") / stb.
+Explain:       df.explain("formatted")  — megmutatja Spark melyiket választotta
 """
 
 import os
+from pyspark.sql.functions import broadcast, col
 from etl.helpers import get_spark_session, read_csv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-spark = get_spark_session("joins-practice")
+spark = get_spark_session("joins-physical-strategies")
 
-products  = read_csv(spark, os.path.join(BASE_DIR, "products.csv"))
-orders    = read_csv(spark, os.path.join(BASE_DIR, "orders.csv"))
+products = read_csv(spark, os.path.join(BASE_DIR, "products.csv"))
+orders = read_csv(spark, os.path.join(BASE_DIR, "orders.csv"))
 customers = read_csv(spark, os.path.join(BASE_DIR, "customers.csv"))
 
-print("=== ALAPTÁBLÁK ===")
-print("-- products (14 sor) --")
-products.select("product_id", "name", "category", "price").show()
-print("-- orders (10 sor) --")
-orders.show()
-print("-- customers (6 sor) --")
-customers.show()
+# ---------------------------------------------------------------------------
+# 1. BROADCAST HASH JOIN
+#
+#    Mikor: egyik tábla kicsi (default küszöb: 10 MB, spark.sql.autoBroadcastJoinThreshold)
+#    Hogyan működik:
+#      - kis tábla teljes egészében elküldi (broadcast) MINDEN executornak
+#      - nagy tábla sorait hash lookup-pal illeszti — nincs shuffle!
+#    Előny: shuffle nélkül → gyors, network-hatékony
+#    Hátrány: ha a "kis" tábla mégsem fér memóriába → OOM
+#
+#    Kényszerítés: broadcast(df) függvénnyel VAGY hint-tel
+# ---------------------------------------------------------------------------
+print("=== 1. BROADCAST HASH JOIN ===")
+print("customers tábla broadcast-olva minden executorra. Nincs shuffle.")
+
+result = orders.join(broadcast(customers), on="customer_id", how="inner")
+result.explain("formatted")
+result.select("order_id", "customer_id", "name", "city", "quantity").show()
+
+# Alternatív hint szintaxis (ugyanaz):
+# orders.join(customers.hint("BROADCAST"), on="customer_id", how="inner")
 
 # ---------------------------------------------------------------------------
-# 1. INNER JOIN
-#    Csak azok a rendelések, amelyekhez létező termék tartozik.
-#    SQL: SELECT * FROM orders JOIN products ON orders.product_id = products.product_id
-#    Eredmény: 8 sor (order 8 és 9 kiesik, mert product_id 99/100 nem létezik)
+# 2. SHUFFLE HASH JOIN
+#
+#    Mikor: mindkét tábla közepes méretű; egyik partition szintjén befér memóriába
+#    Hogyan működik:
+#      - mindkét tábla shuffle-öl join key szerint (azonos key → azonos partíció)
+#      - kisebb oldalból hash tábla épül partition-ként
+#      - nagy oldal sorait hash lookup-pal illeszti
+#    Előny: sort nem kell (gyorsabb mint SortMerge ha adat fér memóriába)
+#    Hátrány: hash tábla memóriában kell legyen; ha spill → lassú
+#
+#    Kényszerítés: SHUFFLE_HASH hint
 # ---------------------------------------------------------------------------
-print("=== 1. INNER JOIN (orders + products) ===")
-print("Csak egyező sorok mindkét oldalon. Order 8/9 kiesik (product 99/100 hiányzik).")
-(orders
-    .join(products, on="product_id", how="inner")
-    .select("order_id", "product_id", "name", "customer_id", "quantity")
-    .orderBy("order_id")
-    .show())
+print("=== 2. SHUFFLE HASH JOIN ===")
+print("Shuffle join key szerint, hash tábla partition-ként. Sort nélkül.")
+
+result = orders.join(products.hint("SHUFFLE_HASH"), on="product_id", how="inner")
+result.explain("formatted")
+result.select("order_id", "product_id", "name", "quantity").show()
 
 # ---------------------------------------------------------------------------
-# 2. LEFT OUTER JOIN  (alias: "left")
-#    Bal tábla (orders) ÖSSZES sora megmarad.
-#    Ha a jobb oldalon (products) nincs egyezés → null.
-#    SQL: SELECT * FROM orders LEFT JOIN products ON ...
-#    Eredmény: 10 sor — order 8/9-nél name=null, price=null
+# 3. SORT MERGE JOIN
+#
+#    Mikor: ALAPÉRTELMEZETT nagy tábláknál (egyik sem broadcast-olható)
+#    Hogyan működik:
+#      - mindkét tábla shuffle-öl join key szerint
+#      - mindkét oldal SORTOL join key szerint
+#      - két rendezett lista merge-elése (mint merge sort utolsó lépése)
+#    Előny: nagy táblákra is stabil; nem kell az egész hash tábla memóriában
+#    Hátrány: sort lépés plusz overhead; shuffle mindenképp van
+#
+#    Kényszerítés: SHUFFLE_MERGE hint
+#    Letiltás:     spark.conf.set("spark.sql.join.preferSortMergeJoin", "false")
 # ---------------------------------------------------------------------------
-print("=== 2. LEFT OUTER JOIN (orders LEFT, products RIGHT) ===")
-print("Összes rendelés megmarad. Hiányzó terméknél null jelenik meg.")
-(orders
-    .join(products, on="product_id", how="left")
-    .select("order_id", "product_id", "name", "customer_id", "quantity")
-    .orderBy("order_id")
-    .show())
+print("=== 3. SORT MERGE JOIN ===")
+print("Default nagy táblákhoz. Shuffle + sort + merge lépések.")
+
+result = orders.hint("SHUFFLE_MERGE").join(products, on="product_id", how="inner")
+result.explain("formatted")
+result.select("order_id", "product_id", "name", "quantity").show()
 
 # ---------------------------------------------------------------------------
-# 3. RIGHT OUTER JOIN  (alias: "right")
-#    Jobb tábla (products) ÖSSZES sora megmarad.
-#    Ha a bal oldalon (orders) nincs egyezés → null.
-#    SQL: SELECT * FROM orders RIGHT JOIN products ON ...
-#    Eredmény: 14+ sor — product 2,4,6,8,10,14-nél order_id=null
+# 4. BROADCAST NESTED LOOP JOIN
+#
+#    Mikor: nincs equi-join feltétel (pl. range join, CROSS JOIN, >, <, !=)
+#    Hogyan működik:
+#      - kis tábla broadcast-olva
+#      - minden sor a nagy táblából összehasonlítva minden broadcast sorral
+#      - O(n × m) komplexitás → LASSÚ nagy adatokon!
+#    Kényszerítés: SHUFFLE_REPLICATE_NL hint
 # ---------------------------------------------------------------------------
-print("=== 3. RIGHT OUTER JOIN (orders LEFT, products RIGHT) ===")
-print("Összes termék megmarad. Rendelt termékek mellé null kerül az order mezőkbe.")
-(orders
-    .join(products, on="product_id", how="right")
-    .select("order_id", "product_id", "name", "customer_id", "quantity")
-    .orderBy("product_id")
-    .show())
+print("=== 4. BROADCAST NESTED LOOP JOIN (non-equi) ===")
+print("Nincs egyenlőség-feltétel. Minden sor × minden sor összehasonlítás.")
+
+# Példa: melyik rendelés drágább termékre szól, mint 100 HUF?
+result = orders.join(
+    products.hint("SHUFFLE_REPLICATE_NL"),
+    on=col("orders.product_id") == col("products.product_id"),
+    how="inner"
+).filter(col("price") > 100)
+result.explain("formatted")
+result.select("order_id", "name", "price", "quantity").orderBy("price").show()
 
 # ---------------------------------------------------------------------------
-# 4. FULL OUTER JOIN  (alias: "outer", "full", "fullouter")
-#    MINDKÉT tábla összes sora megjelenik.
-#    Ahol nincs egyezés (akár bal, akár jobb oldalon) → null.
-#    SQL: SELECT * FROM orders FULL OUTER JOIN products ON ...
-#    Eredmény: order 8/9 (nincs product) + product 2/4/6/8/10/14 (nincs order) is látszik
+# AUTO BROADCAST KÜSZÖB — konfiguráció
+#
+#    Spark automatikusan broadcast-ol ha tábla < küszöb (default 10MB = 10485760 byte)
+#    Kikapcsolás: -1
+#    Növelés pl. 50MB-ra: 52428800
 # ---------------------------------------------------------------------------
-print("=== 4. FULL OUTER JOIN (orders + products) ===")
-print("Minden sor megjelenik mindkét táblából. Hiányzó oldal = null.")
-(orders
-    .join(products, on="product_id", how="outer")
-    .select("order_id", "product_id", "name", "customer_id", "quantity")
-    .orderBy("product_id")
-    .show(20))
+print("=== AUTO BROADCAST KÜSZÖB ===")
+threshold = spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+print(f"Jelenlegi küszöb: {threshold} byte ({int(threshold) // 1024 // 1024} MB)")
+print("Kikapcsoláshoz: spark.conf.set('spark.sql.autoBroadcastJoinThreshold', '-1')")
+print("Növeléshez:     spark.conf.set('spark.sql.autoBroadcastJoinThreshold', '52428800')")
 
 # ---------------------------------------------------------------------------
-# 5. LEFT SEMI JOIN  (alias: "leftsemi", "semi")
-#    Bal tábla azon sorai, amelyeknek VAN egyező jobb oldali soruk.
-#    Jobb tábla oszlopai NEM kerülnek be az eredménybe.
-#    SQL ekvivalens: SELECT * FROM products WHERE product_id IN (SELECT product_id FROM orders)
-#    Eredmény: 8 termék — csak azok, amelyekre érkezett rendelés
+# ÖSSZEFOGLALÓ TÁBLÁZAT
 # ---------------------------------------------------------------------------
-print("=== 5. LEFT SEMI JOIN (products LEFT, orders RIGHT) ===")
-print("Termékek, amelyekre VAN rendelés. Jobb tábla (orders) oszlopai nem jelennek meg.")
-(products
-    .join(orders, on="product_id", how="leftsemi")
-    .select("product_id", "name", "category")
-    .orderBy("product_id")
-    .show())
-
-# ---------------------------------------------------------------------------
-# 6. LEFT ANTI JOIN  (alias: "leftanti", "anti")
-#    Bal tábla azon sorai, amelyeknek NINCS egyező jobb oldali soruk.
-#    A SEMI join ellentéte.
-#    SQL ekvivalens: SELECT * FROM products WHERE product_id NOT IN (SELECT product_id FROM orders)
-#    Eredmény: 6 termék — amelyekre soha nem érkezett rendelés
-# ---------------------------------------------------------------------------
-print("=== 6. LEFT ANTI JOIN (products LEFT, orders RIGHT) ===")
-print("Termékek, amelyekre NINCS rendelés. SEMI join ellentéte.")
-(products
-    .join(orders, on="product_id", how="leftanti")
-    .select("product_id", "name", "category")
-    .orderBy("product_id")
-    .show())
-
-# ---------------------------------------------------------------------------
-# 7. CROSS JOIN  (Descartes-szorzat)
-#    Bal tábla MINDEN sora kombinálva jobb tábla MINDEN sorával.
-#    Feltétel NINCS — n × m sor lesz az eredmény.
-#    Hasznos: kombinációk generálásához, de nagy táblákon veszélyes!
-#    customers (6) × products (14) = 84 sor
-# ---------------------------------------------------------------------------
-print("=== 7. CROSS JOIN (customers × products) ===")
-print("Minden vevő × minden termék kombináció. 6 × 14 = 84 sor.")
-(customers
-    .join(products, how="cross")
-    .select("customer_id", customers["name"].alias("customer"), "product_id", products["name"].alias("product"), "price")
-    .orderBy("customer_id", "product_id")
-    .show(10))
-print("(csak első 10 sor látszik a 84-ből)")
-
-# ---------------------------------------------------------------------------
-# BÓNUSZ: Összetett join feltétel + több táblás join
-#    orders + products + customers egyszerre
-# ---------------------------------------------------------------------------
-print("=== BÓNUSZ: Háromtáblás join (orders + products + customers) ===")
-print("Teljes rendelési lista: rendelő neve, termék neve, ár, darab.")
-(orders
-    .join(products, on="product_id", how="inner")
-    .join(customers, on="customer_id", how="left")
-    .select(
-        "order_id",
-        customers["name"].alias("customer_name"),
-        "city",
-        products["name"].alias("product_name"),
-        "price",
-        "quantity"
-    )
-    .orderBy("order_id")
-    .show())
+print("""
++------------------------+------------------+----------------------------------+------------------+
+| Stratégia              | Shuffle kell?    | Mikor Spark ezt választja        | Hint             |
++------------------------+------------------+----------------------------------+------------------+
+| BroadcastHashJoin      | NEM              | kis tábla < autoBroadcast küszöb | BROADCAST        |
+| ShuffledHashJoin       | IGEN             | közepes tábla, fér hash memóriába| SHUFFLE_HASH     |
+| SortMergeJoin          | IGEN             | nagy tábla (default)             | SHUFFLE_MERGE    |
+| BroadcastNestedLoopJoin| részben          | non-equi join / cross join       | SHUFFLE_REPLICATE_NL |
++------------------------+------------------+----------------------------------+------------------+
+""")
 
 spark.stop()
