@@ -1,0 +1,15 @@
+product_id,name,category,brand,price,stock,rating
+1,iPhone 14,Electronics,Apple,999.99,120,4.7
+2,Galaxy S23,Electronics,Samsung,899.99,85,4.6
+3,Sony WH-1000XM5 Headphones,Electronics,Sony,349.99,60,4.8
+4,Men's Slim Fit Jeans,Clothing,Levis,79.99,200,4.4
+5,Women's Summer Dress,Clothing,Zara,49.99,150,4.3
+6,Unisex Hoodie,Clothing,H&M,39.99,180,4.2
+7,Dyson V11 Vacuum Cleaner,Home,Dyson,599.99,40,4.7
+8,Instant Pot Duo 7-in-1,Home,InstantPot,129.99,90,4.6
+9,Nike Air Zoom Pegasus,Sports,Nike,119.99,130,4.5
+10,Adidas Football,Sports,Adidas,29.99,300,4.4
+11,Atomic Habits,Books,Penguin,19.99,250,4.9
+12,Clean Code,Books,Prentice Hall,34.99,100,4.8
+13,LEGO Star Wars Set,Toys,LEGO,59.99,75,4.9
+14,Barbie Dream House,Toys,Mattel,199.99,50,4.6

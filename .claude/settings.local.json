@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path 'D:\\\\!projects\\\\energy-consumption' -Force | Select-Object Name, @{N='Type'; E={if \\($_.PSIsContainer\\) {'DIR'} else {'FILE'}}})"
+    ]
+  }
+}
